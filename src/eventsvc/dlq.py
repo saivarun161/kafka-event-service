@@ -63,20 +63,29 @@ class DeadLetterQueue:
         self.group_id = group_id or f"{source}-dlq-tools"
         self._clock = clock or SystemClock()
 
-    def entries(self, limit: int | None = None) -> list[DeadLetter]:
+    def entries(
+        self, limit: int | None = None, *, poll_timeout: float = 1.0, empty_polls: int = 5
+    ) -> list[DeadLetter]:
         """Read the dead-letter topic from the beginning, without consuming it.
 
         Uses a throwaway consumer group so inspection never moves the offsets of
         any real consumer — reading a DLQ must not be a destructive act.
+
+        A read only concludes after ``empty_polls`` consecutive empty polls: on a
+        real broker the first polls come back empty while the group is still
+        joining, and a single empty poll would misread a populated DLQ as empty.
         """
         consumer = self.broker.consumer(f"{self.group_id}-view-{id(self)}")
         try:
             consumer.subscribe([self.topic])
             entries: list[DeadLetter] = []
-            while limit is None or len(entries) < limit:
-                batch = consumer.poll(max_records=64, timeout=0.05)
+            empty = 0
+            while (limit is None or len(entries) < limit) and empty < empty_polls:
+                batch = consumer.poll(max_records=256, timeout=poll_timeout)
                 if not batch:
-                    break
+                    empty += 1
+                    continue
+                empty = 0
                 for message in batch:
                     entries.append(DeadLetter(message, FailureInfo.from_message(message)))
                     if limit is not None and len(entries) >= limit:
