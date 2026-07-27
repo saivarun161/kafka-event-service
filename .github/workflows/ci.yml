@@ -53,12 +53,17 @@ jobs:
         env:
           KAFKA_NODE_ID: 1
           KAFKA_PROCESS_ROLES: broker,controller
-          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+          # The broker listener binds 0.0.0.0 so Docker's port mapping reaches it;
+          # the controller listener must bind a concrete host, as KRaft derives
+          # its advertised controller address from it.
+          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://localhost:9093
           KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
           KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
           KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
           KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
           KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
           KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
     steps:
       - uses: actions/checkout@v4
@@ -83,3 +88,6 @@ jobs:
         env:
           KAFKA_BOOTSTRAP_SERVERS: localhost:9092
         run: pytest -m kafka -v
+      - name: Broker logs (on failure)
+        if: failure()
+        run: docker logs "${{ job.services.kafka.id }}" 2>&1 | tail -100
