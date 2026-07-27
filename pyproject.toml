@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kafka-event-service"
+# Single-sourced from eventsvc.__version__ so the two cannot drift apart.
+dynamic = ["version"]
+description = "An event-driven microservice skeleton with consumer groups, tiered retry topics, a dead-letter queue with replay, and Prometheus metrics — broker-agnostic, so it runs in-memory locally and on real Kafka in CI."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Varun Kammadanam", email = "kammadanamsaivarun@gmail.com" }]
+requires-python = ">=3.10"
+keywords = ["kafka", "event-driven", "microservice", "dead-letter-queue", "retries", "prometheus"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+    "prometheus-client>=0.19",
+]
+
+[project.optional-dependencies]
+# Only needed to talk to a real broker; the in-memory broker has no dependencies.
+kafka = ["confluent-kafka>=2.3"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/saivarun161/kafka-event-service"
+Issues = "https://github.com/saivarun161/kafka-event-service/issues"
+
+[project.scripts]
+eventsvc = "eventsvc.cli:main"
+
+[tool.hatch.version]
+path = "src/eventsvc/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eventsvc"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+markers = [
+    "kafka: integration tests that need a reachable Kafka broker (KAFKA_BOOTSTRAP_SERVERS)",
+]
