@@ -108,6 +108,55 @@ class DeadLetterQueue:
             "newest_failed_at": max((e.info.failed_at for e in entries), default=None),
         }
 
+    def matching(
+        self,
+        select: Callable[[DeadLetter], bool] | None = None,
+        limit: int | None = None,
+    ) -> list[DeadLetter]:
+        """The dead letters :meth:`replay` would move, without moving them.
+
+        Selection is factored out of the replay itself so a caller can show an
+        operator exactly what a replay is about to touch — a dry run and the real
+        thing then agree by construction rather than by two filters staying in
+        sync.
+        """
+        chosen: list[DeadLetter] = []
+        for entry in self.entries():
+            if select is not None and not select(entry):
+                continue
+            chosen.append(entry)
+            if limit is not None and len(chosen) >= limit:
+                break
+        return chosen
+
+    def replay_entries(
+        self,
+        *,
+        select: Callable[[DeadLetter], bool] | None = None,
+        limit: int | None = None,
+    ) -> list[DeadLetter]:
+        """Republish matching dead letters and return the ones that were moved.
+
+        The entries, not just a count: after a replay the operator's next move is
+        to follow those records through the logs, which needs their event ids.
+        """
+        chosen = self.matching(select, limit)
+        if not chosen:
+            return []
+        producer = self.broker.producer()
+        try:
+            for entry in chosen:
+                producer.send(
+                    entry.info.original_topic,
+                    entry.message.value,
+                    key=entry.message.key,
+                    headers=replay_headers(entry.message),
+                )
+            producer.flush()
+        finally:
+            producer.close()
+        return chosen
+
     def replay(
         self,
         *,
@@ -120,22 +169,4 @@ class DeadLetterQueue:
         ``limit`` caps the count for a canary replay — after a bad deploy you
         replay five records, watch them land, then replay the rest.
         """
-        producer = self.broker.producer()
-        try:
-            replayed = 0
-            for entry in self.entries():
-                if select is not None and not select(entry):
-                    continue
-                producer.send(
-                    entry.info.original_topic,
-                    entry.message.value,
-                    key=entry.message.key,
-                    headers=replay_headers(entry.message),
-                )
-                replayed += 1
-                if limit is not None and replayed >= limit:
-                    break
-            producer.flush()
-            return replayed
-        finally:
-            producer.close()
+        return len(self.replay_entries(select=select, limit=limit))

@@ -140,6 +140,56 @@ def test_replay_limit_is_a_canary(broker, clock):
     assert service.dlq.replay(limit=2) == 2
 
 
+def test_matching_previews_a_replay_without_performing_it(broker, clock):
+    service = run_service(broker, clock, failing_handler)
+    send(broker, {"order_id": "ord-1", "bad_schema": True})
+    send(broker, {"order_id": "ord-2", "down": True})
+    service.run_until_idle()
+
+    preview = service.dlq.matching(lambda e: e.info.error_type == "RetriableError")
+    assert [e.message.value["order_id"] for e in preview] == ["ord-2"]
+
+    # Nothing moved: the DLQ is untouched and the source topic gained no records.
+    assert service.dlq.summary()["total"] == 2
+    assert not [m for m in broker.log("orders") if m.header_int(REPLAY_COUNT) > 0]
+
+
+def test_matching_and_replay_agree_on_the_same_selection(broker, clock):
+    service = run_service(broker, clock, failing_handler)
+    for n in range(5):
+        send(broker, {"order_id": f"ord-{n}", "down": True})
+    service.run_until_idle()
+
+    def select(entry):
+        return entry.info.attempts >= 2
+
+    preview = service.dlq.matching(select, limit=3)
+    replayed = service.dlq.replay_entries(select=select, limit=3)
+    assert [e.info.event_id for e in preview] == [e.info.event_id for e in replayed]
+
+
+def test_replay_entries_returns_what_it_moved(broker, clock):
+    service = run_service(broker, clock, failing_handler)
+    send(broker, {"order_id": "ord-1", "down": True})
+    send(broker, {"order_id": "ord-2", "bad_schema": True})
+    service.run_until_idle()
+
+    moved = service.dlq.replay_entries(select=lambda e: e.info.error_type != "PermanentError")
+    assert [e.message.value["order_id"] for e in moved] == ["ord-1"]
+    # The event ids are the point: they are what an operator greps for next.
+    assert moved[0].info.event_id
+    assert moved[0].info.error_message.startswith("downstream 503")
+
+
+def test_replay_of_an_empty_selection_moves_nothing(broker, clock):
+    service = run_service(broker, clock, failing_handler)
+    send(broker, {"order_id": "ord-1", "bad_schema": True})
+    service.run_until_idle()
+
+    assert service.dlq.replay_entries(select=lambda e: False) == []
+    assert not [m for m in broker.log("orders") if m.header_int(REPLAY_COUNT) > 0]
+
+
 def test_replayed_and_refailed_records_show_their_round_trips(broker, clock):
     service = run_service(broker, clock, failing_handler)
     send(broker, {"order_id": "ord-1", "down": True})
