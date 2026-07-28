@@ -181,6 +181,23 @@ def test_replay_entries_returns_what_it_moved(broker, clock):
     assert moved[0].info.error_message.startswith("downstream 503")
 
 
+def test_replay_all_moves_exactly_the_entries_it_was_given(broker, clock):
+    service = run_service(broker, clock, failing_handler)
+    send(broker, {"order_id": "ord-1", "down": True})
+    send(broker, {"order_id": "ord-2", "down": True})
+    service.run_until_idle()
+
+    chosen = service.dlq.matching(limit=1)
+    # A record dead-lettered after the selection was made must not ride along.
+    send(broker, {"order_id": "ord-3", "down": True})
+    service.run_until_idle()
+
+    moved = service.dlq.replay_all(chosen)
+    assert [e.info.event_id for e in moved] == [e.info.event_id for e in chosen]
+    replayed = [m for m in broker.log("orders") if m.header_int(REPLAY_COUNT) > 0]
+    assert [m.key for m in replayed] == [chosen[0].message.key]
+
+
 def test_replay_of_an_empty_selection_moves_nothing(broker, clock):
     service = run_service(broker, clock, failing_handler)
     send(broker, {"order_id": "ord-1", "bad_schema": True})
