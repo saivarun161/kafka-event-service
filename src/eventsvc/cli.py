@@ -1,9 +1,14 @@
-"""The ``eventsvc`` command: a self-contained demo of the whole topology.
+"""The ``eventsvc`` command: a demo of the whole topology, and DLQ operations.
 
 ``eventsvc demo`` produces the sample order stream, runs the service to
 completion on the in-memory broker, prints what happened to every record, and
 finishes with a DLQ summary, a replay, and (optionally) the raw Prometheus
 exposition. ``--kafka`` points the identical run at a real broker.
+
+``eventsvc dlq`` is the on-call half: point it at a real broker to summarize,
+list, and selectively replay a dead-letter topic without writing a script at
+3am. Replay writes to production topics, so it is guarded — see
+:func:`run_dlq_replay`.
 """
 
 from __future__ import annotations
@@ -11,11 +16,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from typing import Any
 
 from . import __version__
 from .broker import Broker
 from .clock import Clock, ManualClock, SystemClock
+from .dlq import DeadLetter, DeadLetterQueue
 from .memory import InMemoryBroker
 from .metrics import Metrics
 from .retry import RetryPolicy
@@ -60,7 +67,59 @@ def build_parser() -> argparse.ArgumentParser:
     topics.add_argument("--max-attempts", type=int, default=4)
     topics.add_argument("--base-delay", type=float, default=1.0)
 
+    _add_dlq_parser(sub)
     return parser
+
+
+def _add_dlq_parser(sub: argparse._SubParsersAction) -> None:
+    dlq = sub.add_parser("dlq", help="inspect and replay a dead-letter topic on a real broker")
+    dlq.set_defaults(dlq_parser=dlq)
+    dlq_sub = dlq.add_subparsers(dest="dlq_command")
+
+    def common(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        parser.add_argument("--topic", default="orders", help="source topic (default: orders)")
+        parser.add_argument(
+            "--kafka",
+            metavar="BOOTSTRAP",
+            help="bootstrap address of the broker holding the dead-letter topic",
+        )
+        parser.add_argument("--json", action="store_true", help="emit results as JSON")
+        return parser
+
+    def filters(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        parser.add_argument(
+            "--error-type",
+            action="append",
+            metavar="NAME",
+            help="only records whose last failure was this exception type (repeatable)",
+        )
+        parser.add_argument(
+            "--key", action="append", metavar="KEY", help="only records with this key (repeatable)"
+        )
+        parser.add_argument(
+            "--max-replays",
+            type=int,
+            metavar="N",
+            help="skip records already replayed more than N times",
+        )
+        parser.add_argument("--limit", type=int, metavar="N", help="stop after N matching records")
+        return parser
+
+    common(filters(dlq_sub.add_parser("list", help="list dead letters with their failure history")))
+    common(dlq_sub.add_parser("summary", help="aggregate the dead-letter topic by error type"))
+
+    replay = common(filters(dlq_sub.add_parser("replay", help="republish dead letters")))
+    replay.add_argument(
+        "--include-permanent",
+        action="store_true",
+        help="also replay PermanentError records (skipped by default: they fail the same way)",
+    )
+    replay.add_argument(
+        "--dry-run", action="store_true", help="show exactly what would be replayed, write nothing"
+    )
+    replay.add_argument(
+        "--yes", action="store_true", help="skip the confirmation prompt (required when piped)"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -71,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.command == "topics":
         return _cmd_topics(args)
+    if args.command == "dlq":
+        return _cmd_dlq(args)
     return _cmd_demo(args)
 
 
@@ -195,6 +256,211 @@ def _print_report(
         print(f"  not replayed: {remaining} (permanent failures stay put)")
 
     print(f"\n── processed orders: {', '.join(handler.processed_ids())}")
+
+
+# -- dlq: the on-call commands ---------------------------------------------
+
+
+def _cmd_dlq(args: argparse.Namespace) -> int:
+    if args.dlq_command is None:
+        args.dlq_parser.print_help()
+        return 2
+    if not args.kafka:
+        # The in-memory broker lives in the process that created it, so there is
+        # nothing for a separate `eventsvc dlq` invocation to read. Saying so
+        # beats printing a convincing, permanently-empty dead-letter topic.
+        print(
+            "eventsvc dlq needs --kafka BOOTSTRAP: a dead-letter topic to operate on has to "
+            "outlive the command, and the in-memory broker does not.",
+            file=sys.stderr,
+        )
+        return 2
+
+    from .kafka import KafkaBroker  # imported lazily: needs the [kafka] extra
+
+    broker = KafkaBroker(args.kafka)
+    try:
+        dlq = DeadLetterQueue(broker, args.topic)
+        if args.dlq_command == "summary":
+            return run_dlq_summary(dlq, as_json=args.json)
+        if args.dlq_command == "list":
+            return run_dlq_list(dlq, select=_dlq_select(args), limit=args.limit, as_json=args.json)
+        return run_dlq_replay(
+            dlq,
+            select=_dlq_select(args),
+            limit=args.limit,
+            dry_run=args.dry_run,
+            assume_yes=args.yes,
+            as_json=args.json,
+        )
+    finally:
+        broker.close()
+
+
+def _dlq_select(args: argparse.Namespace) -> Callable[[DeadLetter], bool] | None:
+    """Build one predicate from the filter flags, or ``None`` for everything.
+
+    ``PermanentError`` records are excluded from a replay by default — a failure
+    that is permanent by definition will make the identical round trip — but an
+    explicit ``--error-type`` wins, so asking for them by name is not silently
+    overruled by the default.
+    """
+    error_types = set(args.error_type or ())
+    keys = set(args.key or ())
+    max_replays = args.max_replays
+    # Only `replay` carries --include-permanent; `list` shows everything it finds.
+    is_replay = hasattr(args, "include_permanent")
+    skip_permanent = is_replay and not args.include_permanent and not error_types
+
+    if not (error_types or keys or max_replays is not None or skip_permanent):
+        return None
+
+    def select(entry: DeadLetter) -> bool:
+        if error_types and entry.info.error_type not in error_types:
+            return False
+        if keys and entry.message.key not in keys:
+            return False
+        if max_replays is not None and entry.replay_count > max_replays:
+            return False
+        return not (skip_permanent and entry.info.error_type == "PermanentError")
+
+    return select
+
+
+def run_dlq_summary(dlq: DeadLetterQueue, *, as_json: bool = False) -> int:
+    """Aggregate the dead-letter topic: how many, failing how, since when."""
+    summary = dlq.summary()
+    if as_json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0
+
+    print(f"── {summary['topic']} — {summary['total']} dead letter(s)")
+    if not summary["total"]:
+        return 0
+    width = max(len(name) for name in summary["by_error"])
+    for error, count in summary["by_error"].items():
+        print(f"  {error:<{width}}  {count}")
+    now = dlq.clock.now()
+    print(f"\n  oldest failure : {_format_age(now - summary['oldest_failed_at'])} ago")
+    print(f"  newest failure : {_format_age(now - summary['newest_failed_at'])} ago")
+    if summary["replayed_before"]:
+        print(f"  replayed before: {summary['replayed_before']} (the earlier fix did not hold)")
+    return 0
+
+
+def run_dlq_list(
+    dlq: DeadLetterQueue,
+    *,
+    select: Callable[[DeadLetter], bool] | None = None,
+    limit: int | None = None,
+    as_json: bool = False,
+) -> int:
+    """List matching dead letters with the failure history that makes them actionable."""
+    entries = dlq.matching(select, limit)
+    if as_json:
+        print(json.dumps([entry.as_dict() for entry in entries], indent=2, sort_keys=True))
+        return 0
+
+    print(f"── {dlq.topic} — {len(entries)} matching dead letter(s)")
+    now = dlq.clock.now()
+    for entry in entries:
+        print(f"  {_format_entry(entry, now)}")
+    return 0
+
+
+def run_dlq_replay(
+    dlq: DeadLetterQueue,
+    *,
+    select: Callable[[DeadLetter], bool] | None = None,
+    limit: int | None = None,
+    dry_run: bool = False,
+    assume_yes: bool = False,
+    as_json: bool = False,
+    confirm: Callable[[list[DeadLetter], str], bool] | None = None,
+) -> int:
+    """Republish matching dead letters, after showing the operator what it will touch.
+
+    Replay writes to a live topic, so nothing moves until the selection has been
+    printed and confirmed. Confirmation is interactive by default and refuses
+    outright when stdin is not a terminal: a piped or cron-driven replay must say
+    ``--yes`` deliberately rather than inherit a prompt nobody sees.
+    """
+    entries = dlq.matching(select, limit)
+    topic = entries[0].info.original_topic if entries else dlq.source
+
+    if not entries or dry_run:
+        _emit_replay_result(entries, topic, as_json=as_json, dry_run=dry_run)
+        return 0
+
+    if not assume_yes:
+        ask = confirm if confirm is not None else _prompt_replay
+        if not ask(entries, topic):
+            return 2
+
+    # Replay the entries that were confirmed, not a re-read of the topic: a
+    # record dead-lettered in the meantime was never on the list anyone saw.
+    moved = dlq.replay_all(entries)
+    _emit_replay_result(moved, topic, as_json=as_json, dry_run=False)
+    return 0
+
+
+def _prompt_replay(entries: list[DeadLetter], topic: str) -> bool:
+    now = SystemClock().now()
+    print(f"── about to replay {len(entries)} record(s) to {topic!r}")
+    for entry in entries[:10]:
+        print(f"  {_format_entry(entry, now)}")
+    if len(entries) > 10:
+        print(f"  … and {len(entries) - 10} more")
+    if not sys.stdin.isatty():
+        print("\nrefusing to replay without a terminal to confirm at: pass --yes.", file=sys.stderr)
+        return False
+    answer = input(f"replay {len(entries)} record(s) to {topic!r}? [y/N] ").strip().lower()
+    if answer in {"y", "yes"}:
+        return True
+    print("aborted; nothing was replayed.")
+    return False
+
+
+def _emit_replay_result(
+    entries: list[DeadLetter], topic: str, *, as_json: bool, dry_run: bool
+) -> None:
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "dry_run": dry_run,
+                    "target_topic": topic,
+                    "count": len(entries),
+                    "records": [entry.as_dict() for entry in entries],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    verb = "would replay" if dry_run else "replayed"
+    print(f"── {verb} {len(entries)} record(s) to {topic!r}")
+    for entry in entries:
+        print(f"  {entry.info.event_id}  {entry.info.error_type}: {entry.info.error_message}")
+
+
+def _format_entry(entry: DeadLetter, now: float) -> str:
+    info = entry.info
+    replays = f"  replays={entry.replay_count}" if entry.replay_count else ""
+    return (
+        f"{info.event_id[:12]:<12} key={entry.message.key or '-':<12} "
+        f"attempts={info.attempts}{replays}  {_format_age(now - info.failed_at)} ago  "
+        f"{info.error_type}: {info.error_message}"
+    )
+
+
+def _format_age(seconds: float) -> str:
+    """Render an age the way an operator reads it: coarse, and never negative."""
+    seconds = max(0.0, seconds)
+    for size, suffix in ((86400.0, "d"), (3600.0, "h"), (60.0, "m")):
+        if seconds >= size:
+            return f"{seconds / size:.0f}{suffix}"
+    return f"{seconds:.0f}s"
 
 
 if __name__ == "__main__":  # pragma: no cover

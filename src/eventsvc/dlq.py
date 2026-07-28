@@ -13,7 +13,7 @@ the round trip — a record on its third replay is a signal that the fix was not
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -61,7 +61,7 @@ class DeadLetterQueue:
         self.source = source
         self.topic = dlq_topic(source)
         self.group_id = group_id or f"{source}-dlq-tools"
-        self._clock = clock or SystemClock()
+        self.clock = clock or SystemClock()
 
     def entries(
         self, limit: int | None = None, *, poll_timeout: float = 1.0, empty_polls: int = 5
@@ -129,6 +129,30 @@ class DeadLetterQueue:
                 break
         return chosen
 
+    def replay_all(self, entries: Sequence[DeadLetter]) -> list[DeadLetter]:
+        """Republish exactly these dead letters, and return them.
+
+        Taking the entries rather than a filter is what lets a caller replay
+        precisely the records it already showed someone: the confirmation and
+        the write act on one list, so nothing that arrived in between rides
+        along on an approval it was never part of.
+        """
+        if not entries:
+            return []
+        producer = self.broker.producer()
+        try:
+            for entry in entries:
+                producer.send(
+                    entry.info.original_topic,
+                    entry.message.value,
+                    key=entry.message.key,
+                    headers=replay_headers(entry.message),
+                )
+            producer.flush()
+        finally:
+            producer.close()
+        return list(entries)
+
     def replay_entries(
         self,
         *,
@@ -140,22 +164,7 @@ class DeadLetterQueue:
         The entries, not just a count: after a replay the operator's next move is
         to follow those records through the logs, which needs their event ids.
         """
-        chosen = self.matching(select, limit)
-        if not chosen:
-            return []
-        producer = self.broker.producer()
-        try:
-            for entry in chosen:
-                producer.send(
-                    entry.info.original_topic,
-                    entry.message.value,
-                    key=entry.message.key,
-                    headers=replay_headers(entry.message),
-                )
-            producer.flush()
-        finally:
-            producer.close()
-        return chosen
+        return self.replay_all(self.matching(select, limit))
 
     def replay(
         self,
