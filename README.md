@@ -75,7 +75,7 @@ The demo pushes 12 synthetic orders through the service. Nine are clean; two hit
 
 The demo completes instantly even though the ladder spans 13 seconds of delay, because time is injected: under the simulated clock the scheduler jumps straight to the next due record. Run `eventsvc demo --real-time` to wait the delays out for real, `--json` for machine-readable output, `--metrics` to dump the Prometheus exposition, and `eventsvc topics` to print the topic topology for any policy.
 
-Same demo, real broker: `eventsvc demo --kafka localhost:9092` (needs `pip install -e ".[dev,kafka]"`).
+Same demo, real broker: `eventsvc demo --kafka localhost:9092` (needs `pip install -e ".[dev,kafka]"`). Against a real broker there is also `eventsvc dlq` — [operating the dead-letter queue](#operating-the-dlq-from-the-command-line) without writing a script.
 
 ## Using it as a library
 
@@ -108,6 +108,55 @@ service.dlq.summary()
 service.dlq.replay(select=lambda e: e.info.error_type == "KeyError", limit=5)
 # canary: replay 5, watch them land, then replay the rest
 ```
+
+## Operating the DLQ from the command line
+
+A dead-letter queue you can only reach from a Python REPL is one you will not reach at 3am. `eventsvc dlq` is the same tooling as a command, pointed at a real broker:
+
+```bash
+eventsvc dlq summary --topic orders --kafka broker:9092
+```
+
+```text
+── orders.dlq — 47 dead letter(s)
+  RetriableError  45
+  PermanentError   2
+
+  oldest failure : 3h ago
+  newest failure : 2m ago
+```
+
+```bash
+eventsvc dlq list --topic orders --kafka broker:9092 --error-type RetriableError --limit 3
+```
+
+```text
+── orders.dlq — 3 matching dead letter(s)
+  054992fb7e63 key=ord-1001     attempts=4   12m ago  RetriableError: payment gateway timeout
+  7666cea01eb6 key=ord-1042     attempts=4    9m ago  RetriableError: payment gateway timeout
+  b1880b6b0b12 key=ord-1043     attempts=4  replays=1   2m ago  RetriableError: payment gateway timeout
+```
+
+Then replay, once the downstream is actually fixed:
+
+```bash
+# see what it would touch — writes nothing
+eventsvc dlq replay --kafka broker:9092 --error-type RetriableError --dry-run
+
+# canary five, watch them land, then take the rest
+eventsvc dlq replay --kafka broker:9092 --error-type RetriableError --limit 5
+```
+
+Replay republishes to a live topic, so it is deliberately not the convenient path:
+
+- **The selection is shown before anything moves**, and `--dry-run` shows it without moving anything at all.
+- **Confirmation is required.** With no terminal to prompt at — a pipe, a cron job, a CI step — the command *refuses* rather than falling through a prompt nobody would see. Automation has to pass `--yes` on purpose.
+- **What was confirmed is what moves.** The approved records are replayed by identity, so a record that lands in the DLQ between the preview and the write does not ride along on an approval it was never part of.
+- **`PermanentError` records are skipped by default** — a failure that is permanent by definition will make the identical round trip. Naming the type explicitly (`--error-type PermanentError`) overrides that; the default never silently discards a filter you asked for.
+
+Filters (`--error-type`, `--key`, `--max-replays`, `--limit`) are shared by `list` and `replay`, so the command that showed you the damage is the command that fixes it, with one flag changed. `--json` on any of them gives machine-readable output for a runbook.
+
+`eventsvc dlq` requires `--kafka`: the in-memory broker dies with the process that created it, so there would be nothing for a separate invocation to read, and a convincing but permanently-empty DLQ view is worse than an error message.
 
 ## What the failure headers buy you
 
@@ -170,14 +219,30 @@ src/eventsvc/
   idempotency.py  bounded TTL'd dedupe store (protocol + in-memory impl)
   metrics.py      Prometheus metric surface
   samples.py      deterministic demo workload
-  cli.py          eventsvc demo / eventsvc topics
+  cli.py          eventsvc demo / topics / dlq
 ```
+
+## Roadmap
+
+- [x] Broker protocol with an in-memory implementation that has real log semantics
+- [x] Tiered retry topics, failure-provenance headers, and dead-lettering
+- [x] At-least-once delivery with a pluggable idempotency store
+- [x] DLQ inspection, aggregation, and selective replay
+- [x] Prometheus metrics chosen for on-call use
+- [x] Kafka adapter, exercised against a real broker in CI
+- [x] `eventsvc dlq` — operate the dead-letter queue from the command line
+- [ ] Consumer-lag exporter that reads committed offsets without joining the group
+- [ ] Redis-backed idempotency store so dedupe survives a restart and spans replicas
+- [ ] Batch handlers: hand a worker a slice of records, commit once
+- [ ] Graceful drain on SIGTERM — finish in-flight records before the rebalance
+- [ ] Schema validation at the edge, so a malformed payload is permanent by construction
+- [ ] `py.typed` and a strict type-check gate in CI
 
 ## Development
 
 ```bash
 pip install -e ".[dev]"
-pytest                        # 86 tests, all offline, < 1s
+pytest                        # 111 tests, all offline, < 1s
 ruff check src tests
 
 # integration tests against any reachable broker:

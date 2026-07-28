@@ -338,8 +338,9 @@ def run_dlq_summary(dlq: DeadLetterQueue, *, as_json: bool = False) -> int:
     if not summary["total"]:
         return 0
     width = max(len(name) for name in summary["by_error"])
+    digits = max(len(str(count)) for count in summary["by_error"].values())
     for error, count in summary["by_error"].items():
-        print(f"  {error:<{width}}  {count}")
+        print(f"  {error:<{width}}  {count:>{digits}}")
     now = dlq.clock.now()
     print(f"\n  oldest failure : {_format_age(now - summary['oldest_failed_at'])} ago")
     print(f"  newest failure : {_format_age(now - summary['newest_failed_at'])} ago")
@@ -449,7 +450,7 @@ def _format_entry(entry: DeadLetter, now: float) -> str:
     replays = f"  replays={entry.replay_count}" if entry.replay_count else ""
     return (
         f"{info.event_id[:12]:<12} key={entry.message.key or '-':<12} "
-        f"attempts={info.attempts}{replays}  {_format_age(now - info.failed_at)} ago  "
+        f"attempts={info.attempts}{replays}  {_format_age(now - info.failed_at):>4} ago  "
         f"{info.error_type}: {info.error_message}"
     )
 
