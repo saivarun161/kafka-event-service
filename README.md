@@ -180,6 +180,56 @@ A dead letter is therefore diagnosable on its own: what failed, how it failed, h
 - **Duplicates are absorbed, not prevented.** A bounded, TTL'd idempotency store filters event ids that already succeeded. It is a protocol (`IdempotencyStore`), so a deployment can back it with Redis and share it across replicas. Failures are deliberately *not* marked — a failed record must stay retryable.
 - **Ordering per key, not globally.** Records are partitioned by key with the same CRC32 rule on both brokers, so all events for one customer stay in one partition and arrive in order — until a record detours through the retry ladder, which trades per-key ordering for keeping the partition unblocked. That trade is the whole point of tiered retries.
 
+## Shutting down without losing the batch
+
+A deployment stops a consumer the same way it stops anything else: SIGTERM, then
+SIGKILL once the grace period expires. What happens in between is the process's
+problem, and the default is bad — the worker dies mid-batch, the offsets for the
+records it *did* handle were never committed, and the group rebalances onto a
+partition whose last few records are about to be redelivered. At-least-once makes
+that redelivery safe, not free: every dropped batch is duplicate work downstream,
+and the dedupe store only absorbs the records that actually finished.
+
+`run_forever` is the long-running entry point, and it drains:
+
+```python
+service = EventService(broker=KafkaBroker("broker:9092"), topic="orders", handler=handle)
+report = service.run_forever(timeout=25.0)      # blocks until SIGTERM/SIGINT
+log.info("shutdown: %s", report)
+# shutdown: drained 4/4 worker(s) in 0.412s — clean
+```
+
+The order is what matters:
+
+1. **Stop accepting new records.** Each worker finishes the batch already in its
+   hands — the loop only re-checks the stop flag between batches.
+2. **Commit those offsets**, so the work that just completed is not repeated.
+3. **Then** close the consumer and leave the group, so the rebalance happens once,
+   after the work is done, instead of in the middle of it.
+
+Some details that are easy to get wrong:
+
+- **The timeout is a deadline for the whole fleet, not for each worker.** A grace
+  period does not get longer because the topology grew two more retry tiers, and
+  joining five threads with a five-second timeout each is a twenty-five second
+  shutdown wearing a five-second label. Set it below the orchestrator's
+  `terminationGracePeriodSeconds`.
+- **A worker still inside its handler when the deadline expires is named, not
+  killed.** Closing its consumer is precisely the mid-batch rebalance this path
+  exists to avoid, so the report lists it as a straggler and the process exit
+  releases it. `report.clean` is false, and that is a real signal — a shutdown
+  that quietly gave up on two workers otherwise looks exactly like a good one.
+- **The signal handler only sets an event.** It runs between two bytecodes of
+  whichever thread was executing, so draining a consumer group from inside it is
+  a good way to deadlock on a lock that thread already holds. The waiting thread
+  does the actual work.
+- **`stop(drain=False)` stops between records**, handing the rest of the batch
+  back for redelivery. That is the second-signal behaviour — when the grace
+  period is nearly up, being redelivered beats being killed mid-commit.
+
+`shutdown_on_signals` is usable on its own, and restores the previous handlers on
+exit so importing this library does not permanently repoint your process's SIGINT.
+
 ## Metrics
 
 `Metrics.serve(port)` exposes `/metrics`; the set is picked to answer the on-call questions in the order they get asked:
@@ -216,6 +266,7 @@ src/eventsvc/
   worker.py       the consume loop: dedupe -> handle -> route -> commit
   service.py      topology wiring; cooperative and threaded run modes
   dlq.py          dead-letter inspection, summary, selective replay
+  lifecycle.py    signal watch, drain-on-SIGTERM, shutdown reporting
   idempotency.py  bounded TTL'd dedupe store (protocol + in-memory impl)
   metrics.py      Prometheus metric surface
   samples.py      deterministic demo workload
@@ -234,7 +285,7 @@ src/eventsvc/
 - [ ] Consumer-lag exporter that reads committed offsets without joining the group
 - [ ] Redis-backed idempotency store so dedupe survives a restart and spans replicas
 - [ ] Batch handlers: hand a worker a slice of records, commit once
-- [ ] Graceful drain on SIGTERM — finish in-flight records before the rebalance
+- [x] Graceful drain on SIGTERM — finish in-flight records before the rebalance
 - [ ] Schema validation at the edge, so a malformed payload is permanent by construction
 - [ ] `py.typed` and a strict type-check gate in CI
 
@@ -242,7 +293,7 @@ src/eventsvc/
 
 ```bash
 pip install -e ".[dev]"
-pytest                        # 111 tests, all offline, < 1s
+pytest                        # 136 tests, all offline
 ruff check src tests
 
 # integration tests against any reachable broker:
