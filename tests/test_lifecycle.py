@@ -298,3 +298,32 @@ def test_stopping_twice_is_harmless():
     second = service.stop(timeout=5.0)
     assert second.clean
     assert second.drained == second.workers
+
+
+def test_duplicate_worker_labels_do_not_close_the_wrong_consumer():
+    """Stragglers are tracked by identity; a shared label must not leak a close."""
+    release = threading.Event()
+    entered = threading.Event()
+
+    def stuck_handler(message):
+        entered.set()
+        release.wait(30.0)
+
+    service = build_service(stuck_handler)
+    for worker in service.workers:
+        worker.client_id = "same-label-everywhere"
+
+    service.broker.producer().send(
+        "orders", {"order_id": "ord-1"}, key="acme", headers={"x-event-id": "e1"}
+    )
+    service.start()
+    assert entered.wait(5.0)
+    try:
+        report = service.stop(timeout=0.2)
+        assert report.stragglers == ("same-label-everywhere",)
+        stuck = [w for w in service.workers if w.topic == "orders"]
+        assert not any(w._consumer._closed for w in stuck)
+        # Every other worker drained and did leave the group.
+        assert all(w._consumer._closed for w in service.workers if w.topic != "orders")
+    finally:
+        release.set()

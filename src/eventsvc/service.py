@@ -152,23 +152,26 @@ class EventService:
             worker.stop(drain=drain)
 
         deadline = started + max(0.0, timeout)
-        stragglers: list[str] = []
+        # Tracked by identity, not by name: a report is free to contain two
+        # workers with the same label, but closing the wrong one's consumer
+        # because of it is the exact bug this method is here to prevent.
+        stragglers: list[Worker] = []
         for thread, worker in zip(self._threads, self.workers, strict=False):
             thread.join(max(0.0, deadline - time.monotonic()))
             if thread.is_alive():
-                stragglers.append(worker.name)
+                stragglers.append(worker)
         self._threads.clear()
 
-        stuck = set(stragglers)
+        stuck = {id(worker) for worker in stragglers}
         for worker in self.workers:
-            if worker.name not in stuck:
+            if id(worker) not in stuck:
                 worker.close()
         self._stopped = True
 
         return ShutdownReport(
             workers=len(self.workers),
             drained=len(self.workers) - len(stragglers),
-            stragglers=tuple(stragglers),
+            stragglers=tuple(worker.name for worker in stragglers),
             duration=time.monotonic() - started,
         )
 
