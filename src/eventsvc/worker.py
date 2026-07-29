@@ -124,9 +124,21 @@ class Worker:
         self._consumer.subscribe([self.topic])
         self._producer = self.broker.producer()
         self._stopping = threading.Event()
+        self._abandoning = threading.Event()
+        self._finished = threading.Event()
         self._pending_due_at: float | None = None
         self.stats = WorkerStats(topic=self.topic)
         self.handler_name = getattr(self.handler, "__name__", type(self.handler).__name__)
+
+    @property
+    def name(self) -> str:
+        """Identifies this worker in logs and shutdown reports."""
+        return self.client_id or f"{self.group_id}-{self.topic}"
+
+    @property
+    def draining(self) -> bool:
+        """Stop has been requested but :meth:`run` has not returned yet."""
+        return self._stopping.is_set() and not self._finished.is_set()
 
     # -- scheduling hints --------------------------------------------------
 
@@ -163,6 +175,12 @@ class Worker:
         handled = 0
         for tp, messages in by_partition.items():
             for message in messages:
+                if self._abandoning.is_set():
+                    # Hard stop: give the rest of the batch back rather than
+                    # starting work the caller is not waiting for. Records
+                    # already handled above still get committed below.
+                    self._consumer.seek(tp, message.offset)
+                    break
                 due_at = message.header_float(NOT_BEFORE, 0.0)
                 if due_at > self.clock.now() and not self._wait_until(due_at, block):
                     # Not due (or we were told to stop): rewind this partition to
@@ -207,19 +225,47 @@ class Worker:
                 break
         return handled
 
+    def reset(self) -> None:
+        """Clear a previous shutdown so this worker can be run again.
+
+        Separate from :meth:`run` on purpose. Clearing the flags *inside* ``run``
+        would let a stop requested between ``start()`` and the thread actually
+        entering its loop be thrown away — the worker would then run forever
+        while the shutdown that asked it to stop waits out its whole deadline.
+        """
+        self._stopping.clear()
+        self._abandoning.clear()
+        self._finished.clear()
+
     def run(self) -> WorkerStats:
         """Block, consuming until :meth:`stop` is called. Used by the threaded service."""
-        self._stopping.clear()
-        while not self._stopping.is_set():
-            if self.poll_once(blocking=True) == 0:
-                self.clock.sleep(self.poll_timeout)
+        try:
+            while not self._stopping.is_set():
+                if self.poll_once(blocking=True) == 0:
+                    self.clock.sleep(self.poll_timeout)
+        finally:
+            # Set even if the loop dies on an unexpected exception, so a
+            # shutdown does not wait out the full grace period on a thread that
+            # is already gone.
+            self._finished.set()
         return self.stats
 
-    def stop(self) -> None:
+    def stop(self, *, drain: bool = True) -> None:
+        """Ask the loop to wind down.
+
+        With ``drain`` (the default) the batch currently in hand is finished and
+        committed first — the poll loop only re-checks the flag between batches.
+        Without it the worker also stops between *records*, handing the rest of
+        the batch back for redelivery. Draining is what you want on SIGTERM;
+        abandoning is for the second signal, when the grace period is nearly up
+        and redelivering a batch beats being killed mid-commit.
+        """
+        if not drain:
+            self._abandoning.set()
         self._stopping.set()
 
     def close(self) -> None:
-        self.stop()
+        self.stop(drain=False)
         self._consumer.close()
         self._producer.flush()
         self._producer.close()

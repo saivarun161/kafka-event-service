@@ -10,6 +10,7 @@ from .clock import Clock, ManualClock, SystemClock
 from .dlq import DeadLetter, DeadLetterQueue
 from .errors import BrokerError, EventServiceError, PermanentError, RetriableError
 from .idempotency import IdempotencyStore, InMemoryIdempotencyStore, NullIdempotencyStore
+from .lifecycle import DEFAULT_SIGNALS, ShutdownReport, SignalWatch, shutdown_on_signals
 from .memory import InMemoryBroker
 from .metrics import Metrics, Outcome
 from .retry import RetryPolicy, dlq_topic, retry_topic
@@ -20,6 +21,7 @@ from .worker import Worker, WorkerStats
 __version__ = "0.1.0"
 
 __all__ = [
+    "DEFAULT_SIGNALS",
     "Broker",
     "BrokerError",
     "Clock",
@@ -41,10 +43,13 @@ __all__ = [
     "RecordMetadata",
     "RetriableError",
     "RetryPolicy",
+    "ShutdownReport",
+    "SignalWatch",
     "SystemClock",
     "TopicPartition",
     "Worker",
     "WorkerStats",
     "dlq_topic",
     "retry_topic",
+    "shutdown_on_signals",
 ]
