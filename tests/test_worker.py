@@ -270,3 +270,92 @@ def test_metrics_reflect_outcomes(broker, clock):
     )
     assert metrics.value("eventsvc_retry_attempts_total", topic="orders", attempt="1") == 1
     assert metrics.value("eventsvc_offset_commits_total", topic="orders", group="workers") == 1
+
+
+# -- shutdown: draining vs abandoning --------------------------------------
+
+
+def test_drain_finishes_the_batch_it_is_holding(broker, clock):
+    """The default stop lets the current batch complete; that is the drain."""
+    seen = []
+
+    def handler(message):
+        seen.append(message.value["n"])
+        worker.stop()  # SIGTERM lands while the first record is in the handler
+
+    worker = make_worker(broker, clock, handler)
+    producer = broker.producer()
+    for n in range(4):
+        producer.send("orders", {"n": n}, key="k")
+
+    assert worker.poll_once() == 4
+    assert seen == [0, 1, 2, 3]
+    assert worker.stats.ok == 4
+
+
+def test_abandon_gives_the_rest_of_the_batch_back(broker, clock):
+    """A hard stop stops between records — the remainder is redelivered, not lost."""
+    seen = []
+
+    def handler(message):
+        seen.append(message.value["n"])
+        worker.stop(drain=False)
+
+    worker = make_worker(broker, clock, handler)
+    producer = broker.producer()
+    for n in range(4):
+        producer.send("orders", {"n": n}, key="k")
+
+    assert worker.poll_once() == 1
+    assert seen == [0]
+
+    # The abandoned records were rewound, not committed away: a fresh worker in
+    # the same group picks up exactly what was left.
+    worker.close()
+    rest = []
+    replacement = make_worker(broker, clock, lambda m: rest.append(m.value["n"]))
+    replacement.drain()
+    assert rest == [1, 2, 3]
+
+
+def test_a_drained_worker_reports_that_it_finished(broker, clock):
+    worker = make_worker(broker, clock, lambda m: None)
+    assert not worker.draining
+    worker.stop()
+    assert worker.draining  # asked to stop, run() has not returned
+    worker.run()
+    assert not worker.draining
+
+
+def test_run_marks_itself_finished_even_if_the_loop_dies(broker, clock):
+    """A crashed loop must not make shutdown wait out the whole grace period."""
+
+    def handler(message):
+        raise SystemExit("not a handler error — kills the loop")
+
+    worker = make_worker(broker, clock, handler)
+    broker.producer().send("orders", {"n": 1}, key="k")
+    with pytest.raises(SystemExit):
+        worker.run()
+    assert worker._finished.is_set()
+    assert not worker.draining
+
+
+def test_worker_name_falls_back_to_group_and_topic(broker, clock):
+    named = make_worker(broker, clock, lambda m: None, client_id="orders-workers-orders-0")
+    assert named.name == "orders-workers-orders-0"
+    assert make_worker(broker, clock, lambda m: None).name == "workers-orders"
+
+
+def test_a_stop_requested_before_run_is_honoured(broker, clock):
+    """run() must not clear a shutdown that was already asked for."""
+    worker = make_worker(broker, clock, lambda m: None)
+    broker.producer().send("orders", {"n": 1}, key="k")
+    worker.stop()
+    worker.run()  # returns immediately instead of consuming forever
+    assert worker.stats.consumed == 0
+
+    worker.reset()
+    worker.stop()  # a reset worker stops again on request
+    worker.run()
+    assert worker.stats.consumed == 0
