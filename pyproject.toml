@@ -30,6 +30,8 @@ dependencies = [
 kafka = ["confluent-kafka>=2.3"]
 dev = [
     "pytest>=8.0",
+    # A threaded, signal-driven suite: a deadlock must fail the run, not hang it.
+    "pytest-timeout>=2.3",
     "ruff>=0.4",
 ]
 
@@ -56,6 +58,8 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+# No single test here legitimately takes a minute; anything that does is stuck.
+timeout = 60
 markers = [
     "kafka: integration tests that need a reachable Kafka broker (KAFKA_BOOTSTRAP_SERVERS)",
 ]
