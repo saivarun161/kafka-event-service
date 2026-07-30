@@ -4,7 +4,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-An **event-driven microservice skeleton** with the failure-handling machinery that real deployments need and tutorials skip: **consumer groups**, **tiered retry topics** with exponential backoff, a **dead-letter queue you can actually operate** (inspect, aggregate, selectively replay), **at-least-once delivery with idempotent handling**, and **Prometheus metrics** chosen for on-call use.
+An **event-driven microservice skeleton** with the failure-handling machinery that real deployments need and tutorials skip: **consumer groups**, **tiered retry topics** with exponential backoff, a **dead-letter queue you can actually operate** (inspect, aggregate, selectively replay), **at-least-once delivery with idempotent handling**, a **consumer-lag exporter** that keeps reporting after the consumers themselves are gone, and **Prometheus metrics** chosen for on-call use.
 
 The whole service is written against a small broker protocol. Locally and in the test suite it runs on an in-memory broker that faithfully implements log semantics — partitions, consumer groups, offsets, seek — so there is nothing to install. In CI the *same service code* runs against a real Kafka broker in a service container, and the same story passes.
 
@@ -71,11 +71,20 @@ The demo pushes 12 synthetic orders through the service. Nine are clean; two hit
 ── replay — downstream fixed; 1 record(s) republished to 'orders'
   handled ok after replay: 1
   not replayed: 1 (permanent failures stay put)
+
+── lag — group 'orders-workers', 2 record(s) behind
+  orders           0
+  orders.retry.1s  0
+  orders.retry.3s  0
+  orders.retry.9s  0
+  orders.dlq       2
 ```
+
+Every tier is drained and committed; the two records still counted as backlog are the dead letters, on a topic nothing consumes. That last block is read from the broker's metadata rather than from the workers — see [lag, measured from outside the group](#lag-measured-from-outside-the-group).
 
 The demo completes instantly even though the ladder spans 13 seconds of delay, because time is injected: under the simulated clock the scheduler jumps straight to the next due record. Run `eventsvc demo --real-time` to wait the delays out for real, `--json` for machine-readable output, `--metrics` to dump the Prometheus exposition, and `eventsvc topics` to print the topic topology for any policy.
 
-Same demo, real broker: `eventsvc demo --kafka localhost:9092` (needs `pip install -e ".[dev,kafka]"`). Against a real broker there is also `eventsvc dlq` — [operating the dead-letter queue](#operating-the-dlq-from-the-command-line) without writing a script.
+Same demo, real broker: `eventsvc demo --kafka localhost:9092` (needs `pip install -e ".[dev,kafka]"`). Against a real broker there are also the two on-call commands: `eventsvc dlq` — [operating the dead-letter queue](#operating-the-dlq-from-the-command-line) without writing a script — and `eventsvc lag` — [how far behind the group is](#lag-measured-from-outside-the-group), without joining it.
 
 ## Using it as a library
 
@@ -230,6 +239,60 @@ Some details that are easy to get wrong:
 `shutdown_on_signals` is usable on its own, and restores the previous handlers on
 exit so importing this library does not permanently repoint your process's SIGINT.
 
+## Lag, measured from outside the group
+
+The obvious place to compute consumer lag is inside the consumer: ask it what it owns, ask the broker for the high watermark, subtract. `Consumer.lag()` does exactly that, and it has a failure mode worth more than its convenience — **it can only report partitions a living consumer is currently assigned.**
+
+So when the fleet crashes, the lag series does not spike. It stops being exported at all. Prometheus holds the last value for a few minutes and then the partition disappears from the graph, and the alert anyone would actually write —
+
+```promql
+eventsvc_consumer_lag > 10000
+```
+
+— never fires, because there is no series left to evaluate it against. The outage that most needs the metric is the one that deletes it.
+
+`LagExporter` measures the same quantity from the other side, reading the group's committed offsets from the coordinator and the log end offsets from the partition leaders:
+
+```python
+exporter = service.lag_exporter()      # the whole topology: source, retry tiers, DLQ
+exporter.start(interval=15.0)          # daemon thread; also a context manager
+
+snapshot = exporter.snapshot()         # or sample synchronously
+snapshot.total, snapshot.max_lag       # (1043, 601)
+snapshot.worst                         # PartitionLag(orders.retry.9s[0], committed=88, high=689)
+```
+
+What that buys, in order of how much it matters:
+
+- **A dead group still reports.** Every partition of every watched topic is covered whether or not anything is consuming it, so the backlog keeps climbing visibly after the last worker dies.
+- **Measuring does not perturb.** An exporter that subscribed in order to observe would be counted as a member, take a share of the partitions in the rebalance, and consume records the real workers then never see. Observation would cause the incident.
+- **The retry tiers are visible.** A backlog on `orders.retry.9s` is a failing downstream that the source topic cannot show, because those records were committed on the source the moment they were republished. Nothing consumes `orders.dlq` at all, so its lag is simply the number of dead letters nobody has dealt with — a good thing to alert on.
+- **It runs anywhere.** In-process beside the workers, or as a sidecar with no relationship to them: it needs a broker address and a group name, not a seat in the group.
+
+Two distinctions are deliberately kept rather than flattened into one number:
+
+- **Never committed is not offset zero.** A partition the group has never committed reports `committed=None` and sets no `eventsvc_committed_offset` sample at all — publishing a zero there is a lie that `rate()` reads as a consumer sitting perfectly still. "Nothing has ever run here" and "caught up at the start of the log" are different pages.
+- **A commit behind the low watermark is data loss, not lag.** If retention deleted records before the group read them, the group resumes from the low watermark and those records are never delivered to anyone. The lag number is honest about the backlog that still exists (it counts from the low watermark, not the stale commit) and the partition is flagged separately.
+
+From the command line, against a real broker:
+
+```bash
+eventsvc lag --topic orders --kafka broker:9092
+```
+
+```text
+── lag — group 'orders-workers', 1043 record(s) behind
+  orders           437
+  orders.retry.1s  0
+  orders.retry.3s  0
+  orders.retry.9s  604
+  orders.dlq       2
+
+  worst partition: orders.retry.9s[0] — 601 behind
+```
+
+`--verbose` gives a line per partition with the committed and end offsets, `--json` is the runbook form, and `--watch 10` keeps sampling instead of printing once. Reading lag moves no offsets and joins no group, so unlike `dlq replay` it needs no confirmation and no dry run — it is safe to point at production in a loop.
+
 ## Metrics
 
 `Metrics.serve(port)` exposes `/metrics`; the set is picked to answer the on-call questions in the order they get asked:
@@ -240,8 +303,11 @@ exit so importing this library does not permanently repoint your process's SIGIN
 | Is the work succeeding? | `eventsvc_messages_processed{outcome=ok\|retried\|dead_lettered\|duplicate}` |
 | Is it degrading? | `eventsvc_retry_attempts{attempt}` and `eventsvc_dead_letters{error}` |
 | Why is it slow? | `eventsvc_handler_seconds` histogram, `eventsvc_inflight_messages` |
+| Which side stalled? | `eventsvc_committed_offset` vs `eventsvc_log_end_offset` |
 
 Retry depth is the early-warning signal the others miss: throughput looks healthy while every record quietly takes four attempts.
+
+The last row is the one that turns a graph into a diagnosis. A backlog that stops growing is either a consumer that died or a producer that did, and lag alone flattens out identically for both; the two halves of the subtraction exported separately settle it with `rate(eventsvc_committed_offset)` against `rate(eventsvc_log_end_offset)`.
 
 ## Design decisions
 
@@ -266,6 +332,7 @@ src/eventsvc/
   worker.py       the consume loop: dedupe -> handle -> route -> commit
   service.py      topology wiring; cooperative and threaded run modes
   dlq.py          dead-letter inspection, summary, selective replay
+  lag.py          consumer lag read from broker metadata, not from a member
   lifecycle.py    signal watch, drain-on-SIGTERM, shutdown reporting
   idempotency.py  bounded TTL'd dedupe store (protocol + in-memory impl)
   metrics.py      Prometheus metric surface
@@ -282,7 +349,7 @@ src/eventsvc/
 - [x] Prometheus metrics chosen for on-call use
 - [x] Kafka adapter, exercised against a real broker in CI
 - [x] `eventsvc dlq` — operate the dead-letter queue from the command line
-- [ ] Consumer-lag exporter that reads committed offsets without joining the group
+- [x] Consumer-lag exporter that reads committed offsets without joining the group
 - [ ] Redis-backed idempotency store so dedupe survives a restart and spans replicas
 - [ ] Batch handlers: hand a worker a slice of records, commit once
 - [x] Graceful drain on SIGTERM — finish in-flight records before the rebalance
@@ -293,7 +360,7 @@ src/eventsvc/
 
 ```bash
 pip install -e ".[dev]"
-pytest                        # 136 tests, all offline
+pytest                        # 172 tests, all offline
 ruff check src tests
 
 # integration tests against any reachable broker:
