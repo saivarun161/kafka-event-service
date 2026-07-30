@@ -263,3 +263,27 @@ def test_demo_respects_policy_flags(capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["stats"]["retried"] == 0
     assert payload["stats"]["dead_lettered"] == 4  # 1003, 1005, 1008, 1011
+
+
+def test_demo_reports_lag_for_the_whole_topology(capsys):
+    assert main(["demo"]) == 0
+    out = capsys.readouterr().out
+    # Every tier is drained and committed by the end; the residual backlog is
+    # the dead letters, sitting on a topic that nothing consumes.
+    assert "── lag — group 'orders-workers', 2 record(s) behind" in out
+    assert "orders.dlq       2" in out
+
+
+def test_demo_json_includes_the_lag_snapshot(capsys):
+    assert main(["demo", "--json"]) == 0
+    lag = json.loads(capsys.readouterr().out)["lag"]
+    assert lag["group"] == "orders-workers"
+    assert lag["total_lag"] == 2
+    assert lag["by_topic"]["orders"] == 0
+    assert lag["by_topic"]["orders.dlq"] == 2
+
+
+def test_demo_metrics_include_the_log_end_offsets(capsys):
+    assert main(["demo", "--metrics"]) == 0
+    out = capsys.readouterr().out
+    assert 'eventsvc_log_end_offset{partition="0",topic="orders"}' in out

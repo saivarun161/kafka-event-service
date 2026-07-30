@@ -10,6 +10,7 @@ broker fixture differs.
 """
 
 import os
+import time
 import uuid
 
 import pytest
@@ -107,8 +108,6 @@ def test_full_service_story_on_real_kafka(broker, topic):
 
     service.start()
     try:
-        import time
-
         deadline = time.time() + 120
         while time.time() < deadline:
             stats = service.stats()
@@ -146,8 +145,6 @@ def test_full_service_story_on_real_kafka(broker, topic):
     )
     replay_service.start()
     try:
-        import time
-
         deadline = time.time() + 60
         while time.time() < deadline:
             if "ord-1011" in handler.processed_ids():
@@ -156,3 +153,58 @@ def test_full_service_story_on_real_kafka(broker, topic):
     finally:
         replay_service.stop(timeout=10)
     assert "ord-1011" in handler.processed_ids()
+
+
+def test_lag_is_read_from_broker_metadata_without_joining_the_group(broker, topic):
+    """The exporter's two claims, against a real coordinator.
+
+    On a real broker the distinction it depends on is not a detail of the
+    in-memory implementation: an unread group genuinely has ``OFFSET_INVALID``
+    at the coordinator, and a real rebalance would genuinely halve a member's
+    assignment if the exporter joined.
+    """
+    from eventsvc import LagExporter
+
+    group = f"{topic}-workers"
+    producer = broker.producer()
+    for index in range(9):
+        producer.send(topic, {"n": index}, key=f"k{index}")
+    producer.close()
+
+    exporter = LagExporter(broker, group, [topic])
+    before = exporter.snapshot()
+    assert len(before.partitions) == 3
+    assert before.total == 9
+    # Nothing has ever committed here: that must not read back as offset 0.
+    assert len(before.uncommitted()) == 3
+    assert all(entry.low == 0 for entry in before.partitions)
+
+    consumer = broker.consumer(group, client_id="worker-1")
+    consumer.subscribe([topic])
+    consumed = []
+    deadline = time.time() + 60
+    while len(consumed) < 9 and time.time() < deadline:
+        consumed.extend(consumer.poll(max_records=9, timeout=1.0))
+    assert len(consumed) == 9
+    consumer.commit()
+    assignment = consumer.assignment()
+    assert len(assignment) == 3
+
+    caught_up = exporter.snapshot()
+    assert caught_up.total == 0
+    assert not caught_up.uncommitted()
+    # Sampling repeatedly must not cost the live member any partitions: a second
+    # group member would take a share of them in the rebalance.
+    for _ in range(3):
+        exporter.snapshot()
+    assert sorted(consumer.assignment()) == sorted(assignment)
+    consumer.close()
+
+    # With the fleet gone the group still reports — that is the whole point.
+    producer = broker.producer()
+    for index in range(4):
+        producer.send(topic, {"n": 100 + index}, key=f"k{index}")
+    producer.close()
+    after = exporter.snapshot()
+    assert after.total == 4
+    assert not after.uncommitted()
