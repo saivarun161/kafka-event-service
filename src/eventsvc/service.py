@@ -19,6 +19,7 @@ from .broker import Broker
 from .clock import Clock, SystemClock
 from .dlq import DeadLetterQueue
 from .idempotency import IdempotencyStore, InMemoryIdempotencyStore
+from .lag import LagExporter
 from .lifecycle import DEFAULT_SIGNALS, ShutdownReport, shutdown_on_signals
 from .metrics import Metrics
 from .retry import RetryPolicy, dlq_topic
@@ -225,6 +226,27 @@ class EventService:
 
     def dead_letters(self) -> list[Any]:
         return self.dlq.entries()
+
+    def lag_exporter(self, *, include_dlq: bool = True) -> LagExporter:
+        """A lag exporter over this service's whole topology, sharing its metrics.
+
+        The retry tiers are included deliberately: a backlog on
+        ``orders.retry.9s`` is a failing downstream that the source topic's lag
+        cannot show, because those records were committed on the source the
+        moment they were republished. The dead-letter topic is included too —
+        nothing consumes it, so its lag is simply the count of dead letters
+        nobody has dealt with, which is a number worth alerting on.
+        """
+        topics = self.policy.topics_for(self.topic)
+        if not include_dlq:
+            topics = tuple(name for name in topics if name != self.dlq_topic)
+        return LagExporter(
+            self.broker,
+            self.group_id or f"{self.topic}-workers",
+            topics,
+            metrics=self.metrics,
+            clock=self.clock,
+        )
 
     @property
     def dlq_topic(self) -> str:

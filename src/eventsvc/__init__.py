@@ -5,11 +5,12 @@ Prometheus metrics — written against a small broker protocol, so the identical
 service runs on an in-memory broker locally and on real Kafka in CI.
 """
 
-from .broker import Broker, Consumer, Producer
+from .broker import Broker, Consumer, OffsetReader, Producer
 from .clock import Clock, ManualClock, SystemClock
 from .dlq import DeadLetter, DeadLetterQueue
 from .errors import BrokerError, EventServiceError, PermanentError, RetriableError
 from .idempotency import IdempotencyStore, InMemoryIdempotencyStore, NullIdempotencyStore
+from .lag import LagExporter, LagSnapshot, PartitionLag
 from .lifecycle import DEFAULT_SIGNALS, ShutdownReport, SignalWatch, shutdown_on_signals
 from .memory import InMemoryBroker
 from .metrics import Metrics, Outcome
@@ -33,11 +34,15 @@ __all__ = [
     "IdempotencyStore",
     "InMemoryBroker",
     "InMemoryIdempotencyStore",
+    "LagExporter",
+    "LagSnapshot",
     "ManualClock",
     "Message",
     "Metrics",
     "NullIdempotencyStore",
+    "OffsetReader",
     "Outcome",
+    "PartitionLag",
     "PermanentError",
     "Producer",
     "RecordMetadata",

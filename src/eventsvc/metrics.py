@@ -87,6 +87,22 @@ class Metrics:
             ["group"],
             registry=self.registry,
         )
+        # The two halves of the lag subtraction, exported separately. Lag alone
+        # cannot say which side of it stalled — a backlog that stops growing is
+        # either a dead consumer or a dead producer, and those page different
+        # people. Their rates, side by side, answer it immediately.
+        self.committed_offset = Gauge(
+            f"{NAMESPACE}_committed_offset",
+            "Last offset committed by the group, per partition.",
+            ["topic", "partition", "group"],
+            registry=self.registry,
+        )
+        self.log_end_offset = Gauge(
+            f"{NAMESPACE}_log_end_offset",
+            "Offset of the next record to be written to a partition.",
+            ["topic", "partition"],
+            registry=self.registry,
+        )
 
     def render(self) -> str:
         """The registry in Prometheus text exposition format."""
