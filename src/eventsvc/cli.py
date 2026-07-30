@@ -9,6 +9,10 @@ exposition. ``--kafka`` points the identical run at a real broker.
 list, and selectively replay a dead-letter topic without writing a script at
 3am. Replay writes to production topics, so it is guarded — see
 :func:`run_dlq_replay`.
+
+``eventsvc lag`` is the question asked before either of those: how far behind is
+the group, right now. It reads the answer out of broker metadata, so it is safe
+to run against production repeatedly — it never joins the group it measures.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from . import __version__
 from .broker import Broker
 from .clock import Clock, ManualClock, SystemClock
 from .dlq import DeadLetter, DeadLetterQueue
+from .lag import LagExporter, format_snapshot
 from .memory import InMemoryBroker
 from .metrics import Metrics
 from .retry import RetryPolicy
@@ -66,6 +71,33 @@ def build_parser() -> argparse.ArgumentParser:
     topics.add_argument("--topic", default="orders")
     topics.add_argument("--max-attempts", type=int, default=4)
     topics.add_argument("--base-delay", type=float, default=1.0)
+
+    lag = sub.add_parser("lag", help="report a consumer group's lag without joining the group")
+    lag.add_argument("--topic", default="orders", help="source topic (default: orders)")
+    lag.add_argument(
+        "--group",
+        metavar="ID",
+        help="consumer group to measure (default: <topic>-workers, the EventService default)",
+    )
+    lag.add_argument(
+        "--kafka",
+        metavar="BOOTSTRAP",
+        help="bootstrap address of the broker holding the topics",
+    )
+    lag.add_argument("--max-attempts", type=int, default=4, help="tiers to include (default: 4)")
+    lag.add_argument("--base-delay", type=float, default=1.0, help="first retry tier delay")
+    lag.add_argument(
+        "--source-only", action="store_true", help="measure the source topic, not the whole ladder"
+    )
+    lag.add_argument("--verbose", action="store_true", help="one line per partition")
+    lag.add_argument(
+        "--watch",
+        type=float,
+        metavar="SECONDS",
+        help="keep sampling every SECONDS instead of printing once",
+    )
+    lag.add_argument("--samples", type=int, metavar="N", help="with --watch, stop after N samples")
+    lag.add_argument("--json", action="store_true", help="emit results as JSON")
 
     _add_dlq_parser(sub)
     return parser
@@ -132,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_topics(args)
     if args.command == "dlq":
         return _cmd_dlq(args)
+    if args.command == "lag":
+        return _cmd_lag(args)
     return _cmd_demo(args)
 
 
@@ -194,10 +228,15 @@ def _cmd_demo(args: argparse.Namespace) -> int:
             duplicates=after.duplicates - before.duplicates,
         )
 
+    # Sampled last, so it describes the topology as the demo leaves it: the
+    # source topic drained, and whatever is still sitting in the DLQ.
+    lag = service.lag_exporter().export()
+
     if args.json:
         payload: dict[str, Any] = {
             "produced": produced,
             "stats": stats.as_dict(),
+            "lag": lag.as_dict(),
             "dead_letters": [entry.as_dict() for entry in dead],
             "dlq_summary": summary,
             "replayed": replayed,
@@ -207,6 +246,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         _print_report(args, service, handler, produced, replayed, replay_stats)
+        print()
+        for line in format_snapshot(lag):
+            print(line)
 
     if args.metrics:
         print()
@@ -256,6 +298,71 @@ def _print_report(
         print(f"  not replayed: {remaining} (permanent failures stay put)")
 
     print(f"\n── processed orders: {', '.join(handler.processed_ids())}")
+
+
+# -- lag: how far behind, without disturbing anything ----------------------
+
+
+def _cmd_lag(args: argparse.Namespace) -> int:
+    if not args.kafka:
+        # Same reason `dlq` insists: the in-memory broker dies with the process
+        # that created it, so a separate invocation would measure an empty log
+        # belonging to nobody and confidently report a lag of zero.
+        print(
+            "eventsvc lag needs --kafka BOOTSTRAP: a consumer group to measure has to outlive "
+            "the command, and the in-memory broker does not.",
+            file=sys.stderr,
+        )
+        return 2
+
+    from .kafka import KafkaBroker  # imported lazily: needs the [kafka] extra
+
+    policy = RetryPolicy(max_attempts=args.max_attempts, base_delay=args.base_delay)
+    topics = (args.topic,) if args.source_only else policy.topics_for(args.topic)
+    broker = KafkaBroker(args.kafka)
+    try:
+        exporter = LagExporter(broker, args.group or f"{args.topic}-workers", topics)
+        return run_lag(
+            exporter,
+            verbose=args.verbose,
+            as_json=args.json,
+            watch=args.watch,
+            samples=args.samples,
+        )
+    finally:
+        broker.close()
+
+
+def run_lag(
+    exporter: LagExporter,
+    *,
+    verbose: bool = False,
+    as_json: bool = False,
+    watch: float | None = None,
+    samples: int | None = None,
+) -> int:
+    """Print the group's lag once, or every ``watch`` seconds until interrupted.
+
+    Reading lag is a pure observation — no group is joined and no offset moves —
+    so unlike ``dlq replay`` this command needs no confirmation and no dry run.
+    """
+    printed = 0
+    while True:
+        snapshot = exporter.export()
+        if as_json:
+            print(json.dumps(snapshot.as_dict(), indent=2, sort_keys=True))
+        else:
+            if printed:
+                print()
+            for line in format_snapshot(snapshot, verbose=verbose):
+                print(line)
+        printed += 1
+        if watch is None or (samples is not None and printed >= samples):
+            return 0
+        try:
+            exporter.clock.sleep(watch)
+        except KeyboardInterrupt:
+            return 0
 
 
 # -- dlq: the on-call commands ---------------------------------------------
