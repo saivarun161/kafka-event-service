@@ -75,6 +75,34 @@ class InMemoryBroker:
         with self._lock:
             return len(self._logs[tp.topic][tp.partition])
 
+    def watermarks(self, topic: str) -> dict[TopicPartition, tuple[int, int]]:
+        """``(low, high)`` per partition. Nothing is ever retained away here, so low is 0."""
+        with self._lock:
+            if topic not in self._logs:
+                raise BrokerError(f"unknown topic: {topic}")
+            return {
+                TopicPartition(topic, index): (0, len(partition))
+                for index, partition in enumerate(self._logs[topic])
+            }
+
+    def committed(self, group_id: str, topic: str) -> dict[TopicPartition, int | None]:
+        """Read a group's committed offsets without touching its membership.
+
+        Deliberately *not* routed through :meth:`_committed_offset`, which
+        defaults a missing offset to 0: to a lag exporter, "committed at 0" and
+        "never committed" are different situations — the first is a consumer that
+        has read nothing yet, the second may be a group that does not exist. Here
+        the absence is preserved as ``None`` and the caller decides.
+        """
+        with self._lock:
+            if topic not in self._logs:
+                raise BrokerError(f"unknown topic: {topic}")
+            offsets = self._committed.get((group_id, topic), {})
+            return {
+                TopicPartition(topic, index): offsets.get(index)
+                for index in range(len(self._logs[topic]))
+            }
+
     def log(self, topic: str) -> list[Message]:
         """Every record in ``topic``, partition by partition. For tests and the CLI."""
         with self._lock:

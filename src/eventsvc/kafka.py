@@ -72,6 +72,74 @@ class KafkaBroker:
             raise BrokerError(f"unknown topic: {topic}")
         return len(info.partitions)
 
+    def watermarks(self, topic: str) -> dict[TopicPartition, tuple[int, int]]:
+        """``(low, high)`` per partition, via the admin ``ListOffsets`` API.
+
+        The usual way to get a high watermark in this client is
+        ``Consumer.get_watermark_offsets``, which needs a consumer object and
+        therefore a ``group.id``. This route needs neither: it is a metadata call
+        to the partition leaders, so a lag exporter never has to instantiate a
+        consumer that could be mistaken for a member of the group it measures.
+        """
+        spec = self._kafka.admin.OffsetSpec
+        partitions = range(self.partition_count(topic))
+        low = self._list_offsets(topic, partitions, spec.earliest())
+        high = self._list_offsets(topic, partitions, spec.latest())
+        return {
+            TopicPartition(topic, index): (low[index], high[index])
+            for index in partitions
+            if index in low and index in high
+        }
+
+    def _list_offsets(self, topic: str, partitions: Any, spec: Any) -> dict[int, int]:
+        # One spec per call: the request is keyed by TopicPartition, so earliest
+        # and latest for the same partition cannot share a dict.
+        request = {self._kafka.TopicPartition(topic, index): spec for index in partitions}
+        if not request:
+            return {}
+        offsets: dict[int, int] = {}
+        for tp, future in self._admin.list_offsets(request, request_timeout=10).items():
+            try:
+                offsets[tp.partition] = future.result(timeout=10).offset
+            except self._kafka.KafkaException as exc:
+                raise BrokerError(
+                    f"could not list offsets for {topic}[{tp.partition}]: {exc}"
+                ) from exc
+        return offsets
+
+    def committed(self, group_id: str, topic: str) -> dict[TopicPartition, int | None]:
+        """A group's committed offsets, read with ``ListConsumerGroupOffsets``.
+
+        Read from the group coordinator rather than by joining: an exporter that
+        subscribed in order to measure lag would be counted as a member, take a
+        share of the partitions in the rebalance, and consume records the real
+        workers then never see.
+
+        A partition the group has never committed comes back as ``OFFSET_INVALID``
+        (or carrying an error); both become ``None`` rather than a plausible-looking
+        zero, because "no consumer has ever run here" is a different alert from
+        "the consumer is at the start of the log".
+        """
+        count = self.partition_count(topic)
+        partitions = [self._kafka.TopicPartition(topic, index) for index in range(count)]
+        offsets: dict[TopicPartition, int | None] = {
+            TopicPartition(topic, tp.partition): None for tp in partitions
+        }
+        if not partitions:
+            return offsets
+        request = self._kafka.ConsumerGroupTopicPartitions(group_id, partitions)
+        futures = self._admin.list_consumer_group_offsets([request], request_timeout=10)
+        try:
+            for future in futures.values():
+                for tp in future.result(timeout=10).topic_partitions:
+                    if getattr(tp, "error", None) is None and tp.offset >= 0:
+                        offsets[TopicPartition(tp.topic, tp.partition)] = tp.offset
+        except self._kafka.KafkaException as exc:
+            raise BrokerError(
+                f"could not read committed offsets for group {group_id!r}: {exc}"
+            ) from exc
+        return offsets
+
     def producer(self) -> KafkaProducerAdapter:
         return KafkaProducerAdapter(self._kafka, self.bootstrap_servers)
 

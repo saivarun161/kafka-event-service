@@ -71,6 +71,27 @@ class Consumer(Protocol):
 
 
 @runtime_checkable
+class OffsetReader(Protocol):
+    """Reads a group's progress from the outside, as an observer rather than a member.
+
+    :meth:`Consumer.lag` answers "how far behind am *I*", which is only useful
+    while there is an *I*: it reports the assigned partitions of a live consumer,
+    so a group whose consumers have all crashed reports no lag at all — the
+    metric goes quiet at the exact moment it should be screaming. These two calls
+    are the outside view instead. They read the committed offsets and the log end
+    offsets straight from the broker's metadata, which means they see every
+    partition of the topic whether or not anybody is consuming it, and they never
+    join the group they are measuring.
+    """
+
+    def watermarks(self, topic: str) -> dict[TopicPartition, tuple[int, int]]:
+        """``(low, high)`` offsets per partition: the first retained and the next to be written."""
+
+    def committed(self, group_id: str, topic: str) -> dict[TopicPartition, int | None]:
+        """The group's committed offset per partition; ``None`` where it never committed."""
+
+
+@runtime_checkable
 class Broker(Protocol):
     """A factory for producers and consumers, plus minimal topic administration."""
 
@@ -82,6 +103,12 @@ class Broker(Protocol):
 
     def partition_count(self, topic: str) -> int:
         """How many partitions ``topic`` has."""
+
+    def watermarks(self, topic: str) -> dict[TopicPartition, tuple[int, int]]:
+        """``(low, high)`` offsets per partition. See :class:`OffsetReader`."""
+
+    def committed(self, group_id: str, topic: str) -> dict[TopicPartition, int | None]:
+        """A group's committed offsets, read without joining it. See :class:`OffsetReader`."""
 
     def producer(self) -> Producer:
         """A new producer."""
